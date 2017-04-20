@@ -194,6 +194,15 @@ clean-extra-sources:
 # Documentation.
 # --------------------------------------------------------------------
 
+# We need GNU sed below (to fix the malformed manpages) because BSD sed
+# (at least on FreeBSD) doesn't interpret the \n in the replacement
+# string.
+ifeq ($(findstring bsd,$(PLATFORM)),bsd)
+SED ?= gsed
+else
+SED ?= sed
+endif
+
 # xmlto can not read from standard input, so we mess with a tmp file.
 %: %.xml $(DOCS_DIR)/examples-to-end.xsl
 	$(gen_verbose) xmlto --version | \
@@ -201,6 +210,7 @@ clean-extra-sources:
 	    opt='--stringparam man.indent.verbatims=0' ; \
 	xsltproc --novalid $(DOCS_DIR)/examples-to-end.xsl $< > $<.tmp && \
 	xmlto -vv -o $(DOCS_DIR) $$opt man $< 2>&1 | (grep -v '^Note: Writing' || :) && \
+	$(SED) -E -i.tmp -e "s|^(\.HP \\\\w'.*'u) (.*)|\1\n\2|" "$@" && \
 	test -f $@ && \
 	rm $<.tmp
 
