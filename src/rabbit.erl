@@ -147,12 +147,6 @@
                    [{description, "core initialized"},
                     {requires,    kernel_ready}]}).
 
--rabbit_boot_step({empty_db_check,
-                   [{description, "empty DB check"},
-                    {mfa,         {?MODULE, maybe_insert_default_data, []}},
-                    {requires,    core_initialized},
-                    {enables,     routing_ready}]}).
-
 -rabbit_boot_step({upgrade_queues,
                    [{description, "per-vhost message store migration"},
                     {mfa,         {rabbit_upgrade,
@@ -164,7 +158,13 @@
 -rabbit_boot_step({recovery,
                    [{description, "exchange, queue and binding recovery"},
                     {mfa,         {rabbit, recover, []}},
-                    {requires,    core_initialized},
+                    {requires,    [core_initialized]},
+                    {enables,     routing_ready}]}).
+
+-rabbit_boot_step({empty_db_check,
+                   [{description, "empty DB check"},
+                    {mfa,         {?MODULE, maybe_insert_default_data, []}},
+                    {requires,    recovery},
                     {enables,     routing_ready}]}).
 
 -rabbit_boot_step({mirrored_queues,
@@ -328,6 +328,8 @@ broker_start() ->
     start_apps(ToBeLoaded),
     maybe_sd_notify(),
     ok = log_broker_started(rabbit_plugins:strictly_plugins(rabbit_plugins:active())),
+    %% See rabbitmq/rabbitmq-server#1202 for details.
+    rabbit_peer_discovery:maybe_inject_randomized_delay(),
     rabbit_peer_discovery:maybe_register(),
     ok.
 
@@ -469,7 +471,7 @@ stop() ->
         undefined -> ok;
         _         ->
             rabbit_log:info("RabbitMQ hasn't finished starting yet. Waiting for startup to finish before stopping..."),
-            await_startup(true)
+            wait_for_boot_to_finish()
     end,
     rabbit_log:info("RabbitMQ is asked to stop...~n", []),
     Apps = ?APPS ++ rabbit_plugins:active(),
@@ -639,19 +641,32 @@ handle_app_error(Term) ->
     end.
 
 await_startup() ->
-    await_startup(false).
+    case is_booting() of
+        true -> wait_for_boot_to_finish();
+        false ->
+            case is_running() of
+                true -> ok;
+                false -> wait_for_boot_to_start(),
+                         wait_for_boot_to_finish()
+            end
+    end.
 
-await_startup(HaveSeenRabbitBoot) ->
-    %% We don't take absence of rabbit_boot as evidence we've started,
-    %% since there's a small window before it is registered.
+is_booting() ->
+    whereis(rabbit_boot) /= undefined.
+
+wait_for_boot_to_start() ->
     case whereis(rabbit_boot) of
-        undefined -> case HaveSeenRabbitBoot orelse is_running() of
-                         true  -> ok;
-                         false -> timer:sleep(100),
-                                  await_startup(false)
-                     end;
+        undefined -> timer:sleep(100),
+                     wait_for_boot_to_start();
+        _         -> ok
+    end.
+
+wait_for_boot_to_finish() ->
+    case whereis(rabbit_boot) of
+        undefined -> true = is_running(),
+                     ok;
         _         -> timer:sleep(100),
-                     await_startup(true)
+                     wait_for_boot_to_finish()
     end.
 
 status() ->
@@ -827,10 +842,7 @@ boot_delegate() ->
 
 recover() ->
     rabbit_policy:recover(),
-    Qs = rabbit_amqqueue:recover(),
-    ok = rabbit_binding:recover(rabbit_exchange:recover(),
-                                [QName || #amqqueue{name = QName} <- Qs]),
-    rabbit_amqqueue:start(Qs).
+    rabbit_vhost:recover().
 
 maybe_insert_default_data() ->
     case rabbit_table:needs_default_data() of

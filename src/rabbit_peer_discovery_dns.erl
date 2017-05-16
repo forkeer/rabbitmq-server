@@ -19,7 +19,8 @@
 
 -include("rabbit.hrl").
 
--export([list_nodes/0, supports_registration/0, register/0, unregister/0]).
+-export([list_nodes/0, supports_registration/0, register/0, unregister/0,
+         post_registration/0]).
 %% for tests
 -export([discover_nodes/2, discover_hostnames/2]).
 
@@ -63,6 +64,11 @@ register() ->
 -spec unregister() -> ok.
 
 unregister() ->
+    ok.
+
+-spec post_registration() -> ok.
+
+post_registration() ->
     ok.
 
 

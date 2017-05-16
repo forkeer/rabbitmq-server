@@ -52,7 +52,8 @@ groups() ->
               reset_removes_things,
               forget_offline_removes_things,
               force_boot,
-              status_with_alarm
+              status_with_alarm,
+              wait_fails_when_cluster_fails
             ]},
           {cluster_size_4, [], [
               forget_promotes_offline_slave
@@ -73,8 +74,10 @@ suite() ->
 init_per_suite(Config) ->
     rabbit_ct_helpers:log_environment(),
     Config1 = rabbit_ct_helpers:merge_app_env(
-                Config,
-                {rabbit, [{mnesia_table_loading_retry_limit, 1}]}),
+                Config, {rabbit, [
+                          {mnesia_table_loading_retry_limit, 2},
+                          {mnesia_table_loading_retry_timeout,1000}
+                         ]}),
     rabbit_ct_helpers:run_setup_steps(Config1).
 
 end_per_suite(Config) ->
@@ -180,7 +183,8 @@ join_cluster_bad_operations(Config) ->
     ok = stop_app(Hare),
     assert_failure(fun () -> start_app(Hare) end),
     ok = start_app(Rabbit),
-    ok = start_app(Hare),
+    %% The Erlang VM has stopped after previous rabbit app failure
+    ok = rabbit_ct_broker_helpers:start_node(Config, Hare),
     ok.
 
 %% This tests that the nodes in the cluster are notified immediately of a node
@@ -532,25 +536,34 @@ erlang_config(Config) ->
     ok = reset(Hare),
     ok = rpc:call(Hare, application, set_env,
                   [rabbit, cluster_nodes, {["Mike's computer"], disc}]),
+    %% Rabbit app stops abnormally, node goes down
     assert_failure(fun () -> start_app(Hare) end),
     assert_not_clustered(Rabbit),
 
     %% If we use an invalid node type, the node fails to start.
+    %% The Erlang VM has stopped after previous rabbit app failure
+    ok = rabbit_ct_broker_helpers:start_node(Config, Hare),
     ok = stop_app(Hare),
     ok = reset(Hare),
     ok = rpc:call(Hare, application, set_env,
                   [rabbit, cluster_nodes, {[Rabbit], blue}]),
+    %% Rabbit app stops abnormally, node goes down
     assert_failure(fun () -> start_app(Hare) end),
     assert_not_clustered(Rabbit),
 
     %% If we use an invalid cluster_nodes conf, the node fails to start.
+    %% The Erlang VM has stopped after previous rabbit app failure
+    ok = rabbit_ct_broker_helpers:start_node(Config, Hare),
     ok = stop_app(Hare),
     ok = reset(Hare),
     ok = rpc:call(Hare, application, set_env,
                   [rabbit, cluster_nodes, true]),
+    %% Rabbit app stops abnormally, node goes down
     assert_failure(fun () -> start_app(Hare) end),
     assert_not_clustered(Rabbit),
 
+    %% The Erlang VM has stopped after previous rabbit app failure
+    ok = rabbit_ct_broker_helpers:start_node(Config, Hare),
     ok = stop_app(Hare),
     ok = reset(Hare),
     ok = rpc:call(Hare, application, set_env,
@@ -595,8 +608,49 @@ status_with_alarm(Config) ->
     ok = alarm_information_on_each_node(R, Rabbit, Hare).
 
 
+wait_fails_when_cluster_fails(Config) ->
+    [Rabbit, Hare] = rabbit_ct_broker_helpers:get_node_configs(Config,
+      nodename),
+    RabbitConfig = rabbit_ct_broker_helpers:get_node_config(Config,Rabbit),
+    RabbitPidFile = ?config(pid_file, RabbitConfig),
+    %% ensure pid file is readable
+    {ok, _} = file:read_file(RabbitPidFile),
+    %% ensure wait works on running node
+    {ok, _} = rabbit_ct_broker_helpers:rabbitmqctl(Config, Rabbit,
+      ["wait", RabbitPidFile]),
+    %% stop both nodes
+    ok = rabbit_ct_broker_helpers:stop_node(Config, Rabbit),
+    ok = rabbit_ct_broker_helpers:stop_node(Config, Hare),
+    %% starting first node fails - it was not the last node to stop
+    {error, _} = rabbit_ct_broker_helpers:start_node(Config, Rabbit),
+    %% start first node in the background
+    spawn_link(fun() ->
+        rabbit_ct_broker_helpers:start_node(Config, Rabbit)
+    end),
+    Attempts = 10,
+    Timeout = 500,
+    wait_for_pid_file_to_contain_running_process_pid(RabbitPidFile, Attempts, Timeout),
+    {error, _, _} = rabbit_ct_broker_helpers:rabbitmqctl(Config, Rabbit,
+      ["wait", RabbitPidFile]).
+
 %% ----------------------------------------------------------------------------
 %% Internal utils
+%% ----------------------------------------------------------------------------
+
+wait_for_pid_file_to_contain_running_process_pid(_, 0, _) ->
+    error(timeout_waiting_for_pid_file_to_have_running_pid);
+wait_for_pid_file_to_contain_running_process_pid(PidFile, Attempts, Timeout) ->
+    Pid = pid_from_file(PidFile),
+    case rabbit_misc:is_os_process_alive(Pid) of
+        true  -> ok;
+        false -> 
+            ct:sleep(Timeout),
+            wait_for_pid_file_to_contain_running_process_pid(PidFile, Attempts - 1, Timeout)
+    end.
+
+pid_from_file(PidFile) ->
+    {ok, Content} = file:read_file(PidFile),
+    string:strip(binary_to_list(Content), both, $\n).
 
 cluster_members(Config) ->
     rabbit_ct_broker_helpers:get_node_configs(Config, nodename).
