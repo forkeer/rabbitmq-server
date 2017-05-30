@@ -99,7 +99,9 @@ define PROJECT_ENV
 	    {channel_operation_timeout, 15000},
 
 	    %% see rabbitmq-server#486
-	    {peer_discovery_backend, rabbit_peer_discovery_classic_config},
+	    {autocluster,
+              [{peer_discovery_backend, rabbit_peer_discovery_classic_config}]
+            },
 	    %% used by rabbit_peer_discovery_classic_config
 	    {cluster_nodes, {[], disc}},
 
@@ -138,6 +140,7 @@ DOCS_DIR     = docs
 MANPAGES     = $(wildcard $(DOCS_DIR)/*.[0-9])
 WEB_MANPAGES = $(patsubst %,%.html,$(MANPAGES))
 
+DEP_EARLY_PLUGINS = rabbit_common/mk/rabbitmq-early-test.mk
 DEP_PLUGINS = rabbit_common/mk/rabbitmq-build.mk \
 	      rabbit_common/mk/rabbitmq-dist.mk \
 	      rabbit_common/mk/rabbitmq-run.mk \
