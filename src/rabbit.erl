@@ -220,6 +220,11 @@
                                    [rabbit_core_metrics_gc]}},
                     {enables,     networking}]}).
 
+-rabbit_boot_step({rabbit_looking_glass,
+                   [{description, "Looking Glass tracer and profiler"},
+                    {mfa,         {rabbit_looking_glass, boot, []}},
+                    {requires,    networking}]}).
+
 %%---------------------------------------------------------------------------
 
 -include("rabbit_framing.hrl").
@@ -700,7 +705,8 @@ status() ->
           {erlang_version,       erlang:system_info(system_version)},
           {memory,               rabbit_vm:memory()},
           {alarms,               alarms()},
-          {listeners,            listeners()}],
+          {listeners,            listeners()},
+          {vm_memory_calculation_strategy, vm_memory_monitor:get_memory_calculation_strategy()}],
     S2 = rabbit_misc:filter_exit_map(
            fun ({Key, {M, F, A}}) -> {Key, erlang:apply(M, F, A)} end,
            [{vm_memory_high_watermark, {vm_memory_monitor,

@@ -21,18 +21,20 @@
 %%----------------------------------------------------------------------------
 
 -export([recover/0, recover/1]).
--export([add/2, delete/2, exists/1, list/0, with/2, assert/1, update/2,
+-export([add/2, delete/2, exists/1, list/0, with/2, with_user_and_vhost/3, assert/1, update/2,
          set_limits/2, limits_of/1]).
 -export([info/1, info/2, info_all/0, info_all/1, info_all/2, info_all/3]).
 -export([dir/1, msg_store_dir_path/1, msg_store_dir_wildcard/0]).
 -export([delete_storage/1]).
 
--spec add(rabbit_types:vhost(), rabbit_types:username()) -> 'ok'.
--spec delete(rabbit_types:vhost(), rabbit_types:username()) -> 'ok'.
+-spec add(rabbit_types:vhost(), rabbit_types:username()) -> rabbit_types:ok_or_error(any()).
+-spec delete(rabbit_types:vhost(), rabbit_types:username()) -> rabbit_types:ok_or_error(any()).
 -spec update(rabbit_types:vhost(), rabbit_misc:thunk(A)) -> A.
 -spec exists(rabbit_types:vhost()) -> boolean().
 -spec list() -> [rabbit_types:vhost()].
 -spec with(rabbit_types:vhost(), rabbit_misc:thunk(A)) -> A.
+-spec with_user_and_vhost
+        (rabbit_types:username(), rabbit_types:vhost(), rabbit_misc:thunk(A)) -> A.
 -spec assert(rabbit_types:vhost()) -> 'ok'.
 
 -spec info(rabbit_types:vhost()) -> rabbit_types:infos().
@@ -102,10 +104,20 @@ add(VHostPath, ActingUser) ->
                            {<<"amq.rabbitmq.trace">>, topic,   true}]],
                   ok
           end),
-    ok = rabbit_vhost_sup_sup:start_on_all_nodes(VHostPath),
-    rabbit_event:notify(vhost_created, info(VHostPath)
-                        ++ [{user_who_performed_action, ActingUser}]),
-    R.
+    case rabbit_vhost_sup_sup:start_on_all_nodes(VHostPath) of
+        ok ->
+            rabbit_event:notify(vhost_created, info(VHostPath)
+                                ++ [{user_who_performed_action, ActingUser}]),
+            R;
+        {error, {no_such_vhost, VHostPath}} ->
+            Msg = rabbit_misc:format("failed to set up vhost '~s': it was concurrently deleted!",
+                                     [VHostPath]),
+            {error, Msg};
+        {error, Reason} ->
+            Msg = rabbit_misc:format("failed to set up vhost '~s': ~p",
+                                     [VHostPath, Reason]),
+            {error, Msg}
+    end.
 
 delete(VHostPath, ActingUser) ->
     %% FIXME: We are forced to delete the queues and exchanges outside
@@ -123,7 +135,10 @@ delete(VHostPath, ActingUser) ->
           with(VHostPath, fun () -> internal_delete(VHostPath, ActingUser) end)),
     ok = rabbit_event:notify(vhost_deleted, [{name, VHostPath},
                                              {user_who_performed_action, ActingUser}]),
-    [ok = Fun() || Fun <- Funs],
+    [case Fun() of
+         ok                                  -> ok;
+         {error, {no_such_vhost, VHostPath}} -> ok
+     end || Fun <- Funs],
     %% After vhost was deleted from mnesia DB, we try to stop vhost supervisors
     %% on all the nodes.
     rabbit_vhost_sup_sup:delete_on_all_nodes(VHostPath),
@@ -152,7 +167,8 @@ internal_delete(VHostPath, ActingUser) ->
      || Info <- rabbit_auth_backend_internal:list_vhost_permissions(VHostPath)],
     TopicPermissions = rabbit_auth_backend_internal:list_vhost_topic_permissions(VHostPath),
     [ok = rabbit_auth_backend_internal:clear_topic_permissions(
-        proplists:get_value(user, TopicPermission), VHostPath) || TopicPermission <- TopicPermissions],
+        proplists:get_value(user, TopicPermission), VHostPath, ActingUser)
+     || TopicPermission <- TopicPermissions],
     Fs1 = [rabbit_runtime_parameters:clear(VHostPath,
                                            proplists:get_value(component, Info),
                                            proplists:get_value(name, Info),
@@ -178,6 +194,9 @@ with(VHostPath, Thunk) ->
                     Thunk()
             end
     end.
+
+with_user_and_vhost(Username, VHostPath, Thunk) ->
+    rabbit_misc:with_user(Username, with(VHostPath, Thunk)).
 
 %% Like with/2 but outside an Mnesia tx
 assert(VHostPath) -> case exists(VHostPath) of
@@ -213,7 +232,7 @@ set_limits(VHost = #vhost{}, Limits) ->
 
 
 dir(Vhost) ->
-    <<Num:128>> = erlang:md5(term_to_binary(Vhost)),
+    <<Num:128>> = erlang:md5(Vhost),
     rabbit_misc:format("~.36B", [Num]).
 
 msg_store_dir_path(VHost) ->

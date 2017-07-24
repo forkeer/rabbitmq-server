@@ -32,6 +32,7 @@ groups() ->
     [
       {parallel_tests, [parallel], [
           arguments_parser,
+          auth_backend_internal_expand_topic_permission,
           {basic_header_handling, [parallel], [
               write_table_with_invalid_existing_type,
               invalid_existing_headers,
@@ -49,6 +50,7 @@ groups() ->
           pmerge,
           plmerge,
           priority_queue,
+          rabbit_direct_extract_extra_auth_props,
           {resource_monitor, [parallel], [
               parse_information_unit
             ]},
@@ -387,29 +389,23 @@ decrypt_start_app_wrong_passphrase(Config) ->
 
 rabbitmqctl_encode(_Config) ->
     % list ciphers and hashes
-    {ok, _} = rabbit_control_pbe:encode(true, false, undefined, undefined, undefined, undefined, undefined),
-    {ok, _} = rabbit_control_pbe:encode(false, true, undefined, undefined, undefined, undefined, undefined),
+    {ok, _} = rabbit_control_pbe:list_ciphers(),
+    {ok, _} = rabbit_control_pbe:list_hashes(),
     % incorrect ciphers, hashes and iteration number
-    {error, _} = rabbit_control_pbe:encode(false, false, undefined, funny_cipher, undefined, undefined, undefined),
-    {error, _} = rabbit_control_pbe:encode(false, false, undefined, undefined, funny_hash, undefined, undefined),
-    {error, _} = rabbit_control_pbe:encode(false, false, undefined, undefined, undefined, -1, undefined),
-    {error, _} = rabbit_control_pbe:encode(false, false, undefined, undefined, undefined, 0, undefined),
+    {error, _} = rabbit_control_pbe:encode(funny_cipher, undefined, undefined, undefined),
+    {error, _} = rabbit_control_pbe:encode(undefined, funny_hash, undefined, undefined),
+    {error, _} = rabbit_control_pbe:encode(undefined, undefined, -1, undefined),
+    {error, _} = rabbit_control_pbe:encode(undefined, undefined, 0, undefined),
     % incorrect number of arguments
     {error, _} = rabbit_control_pbe:encode(
-        false, false,
-        false, % encrypt
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         []
     ),
     {error, _} = rabbit_control_pbe:encode(
-        false, false,
-        false, % encrypt
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [undefined]
     ),
     {error, _} = rabbit_control_pbe:encode(
-        false, false,
-        false, % encrypt
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [undefined, undefined, undefined]
     ),
@@ -427,44 +423,52 @@ rabbitmqctl_encode(_Config) ->
 rabbitmqctl_encode_encrypt_decrypt(Secret) ->
     PassPhrase = "passphrase",
     {ok, Output} = rabbit_control_pbe:encode(
-        false, false,
-        false, % encrypt
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [Secret, PassPhrase]
     ),
     {encrypted, Encrypted} = rabbit_control_pbe:evaluate_input_as_term(lists:flatten(Output)),
 
-    {ok, Result} = rabbit_control_pbe:encode(
-        false, false,
-        true, % decrypt
+    {ok, Result} = rabbit_control_pbe:decode(
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [lists:flatten(io_lib:format("~p", [Encrypted])), PassPhrase]
     ),
     Secret = lists:flatten(Result),
     % decrypt with {encrypted, ...} form as input
-    {ok, Result} = rabbit_control_pbe:encode(
-        false, false,
-        true, % decrypt
+    {ok, Result} = rabbit_control_pbe:decode(
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [lists:flatten(io_lib:format("~p", [{encrypted, Encrypted}])), PassPhrase]
     ),
 
     % wrong passphrase
-    {error, _} = rabbit_control_pbe:encode(
-        false, false,
-        true, % decrypt
+    {error, _} = rabbit_control_pbe:decode(
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [lists:flatten(io_lib:format("~p", [Encrypted])), PassPhrase ++ " "]
     ),
-    {error, _} = rabbit_control_pbe:encode(
-        false, false,
-        true, % decrypt
+    {error, _} = rabbit_control_pbe:decode(
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [lists:flatten(io_lib:format("~p", [{encrypted, Encrypted}])), PassPhrase ++ " "]
     )
     .
 
-
+rabbit_direct_extract_extra_auth_props(_Config) ->
+    % no protocol to extract
+    [] = rabbit_direct:extract_extra_auth_props(
+        {<<"guest">>, <<"guest">>}, <<"/">>, 1,
+        [{name,<<"127.0.0.1:52366 -> 127.0.0.1:1883">>}]),
+    % protocol to extract, but no module to call
+    [] = rabbit_direct:extract_extra_auth_props(
+        {<<"guest">>, <<"guest">>}, <<"/">>, 1,
+        [{protocol, {'PROTOCOL_WITHOUT_MODULE', "1.0"}}]),
+    % see rabbit_dummy_protocol_connection_info module
+    % protocol to extract, module that returns a client ID
+    [{client_id, <<"DummyClientId">>}] = rabbit_direct:extract_extra_auth_props(
+        {<<"guest">>, <<"guest">>}, <<"/">>, 1,
+        [{protocol, {'DUMMY_PROTOCOL', "1.0"}}]),
+    % protocol to extract, but error thrown in module
+    [] = rabbit_direct:extract_extra_auth_props(
+        {<<"guest">>, <<"guest">>}, <<"/">>, -1,
+        [{protocol, {'DUMMY_PROTOCOL', "1.0"}}]),
+    ok.
 
 %% -------------------------------------------------------------------
 %% pg_local.
@@ -1001,4 +1005,38 @@ listing_plugins_from_multiple_directories(Config) ->
             ct:pal("Got ~p~nExpected: ~p", [Got, Expected]),
             exit({wrong_plugins_list, Got})
     end,
+    ok.
+
+auth_backend_internal_expand_topic_permission(_Config) ->
+    ExpandMap = #{<<"username">> => <<"guest">>, <<"vhost">> => <<"default">>},
+    %% simple case
+    <<"services/default/accounts/guest/notifications">> =
+        rabbit_auth_backend_internal:expand_topic_permission(
+            <<"services/{vhost}/accounts/{username}/notifications">>,
+            ExpandMap
+        ),
+    %% replace variable twice
+    <<"services/default/accounts/default/guest/notifications">> =
+        rabbit_auth_backend_internal:expand_topic_permission(
+            <<"services/{vhost}/accounts/{vhost}/{username}/notifications">>,
+            ExpandMap
+        ),
+    %% nothing to replace
+    <<"services/accounts/notifications">> =
+        rabbit_auth_backend_internal:expand_topic_permission(
+            <<"services/accounts/notifications">>,
+            ExpandMap
+        ),
+    %% the expand map isn't defined
+    <<"services/{vhost}/accounts/{username}/notifications">> =
+        rabbit_auth_backend_internal:expand_topic_permission(
+            <<"services/{vhost}/accounts/{username}/notifications">>,
+            undefined
+        ),
+    %% the expand map is empty
+    <<"services/{vhost}/accounts/{username}/notifications">> =
+        rabbit_auth_backend_internal:expand_topic_permission(
+            <<"services/{vhost}/accounts/{username}/notifications">>,
+            #{}
+        ),
     ok.

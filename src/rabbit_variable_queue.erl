@@ -35,6 +35,10 @@
 
 -export([move_messages_to_vhost_store/0]).
 
+-export([migrate_queue/3, migrate_message/3, get_per_vhost_store_client/2,
+         get_global_store_client/1, log_upgrade_verbose/1,
+         log_upgrade_verbose/2]).
+
 -include_lib("stdlib/include/qlc.hrl").
 
 -define(QUEUE_MIGRATION_BATCH_SIZE, 100).
@@ -359,8 +363,6 @@
 -rabbit_upgrade({multiple_routing_keys, local, []}).
 -rabbit_upgrade({move_messages_to_vhost_store, message_store, []}).
 
--compile(export_all).
-
 -type seq_id()  :: non_neg_integer().
 
 -type rates() :: #rates { in        :: float(),
@@ -494,15 +496,26 @@ stop(VHost) ->
 
 start_msg_store(VHost, Refs, StartFunState) when is_list(Refs); Refs == undefined ->
     rabbit_log:info("Starting message stores for vhost '~s'~n", [VHost]),
-    {ok, _} = rabbit_vhost_msg_store:start(VHost,
-                                           ?TRANSIENT_MSG_STORE,
-                                           undefined,
-                                           ?EMPTY_START_FUN_STATE),
-    {ok, _} = rabbit_vhost_msg_store:start(VHost,
-                                           ?PERSISTENT_MSG_STORE,
-                                           Refs,
-                                           StartFunState),
-    rabbit_log:info("Message stores for vhost '~s' are started~n", [VHost]).
+    do_start_msg_store(VHost, ?TRANSIENT_MSG_STORE, undefined, ?EMPTY_START_FUN_STATE),
+    do_start_msg_store(VHost, ?PERSISTENT_MSG_STORE, Refs, StartFunState),
+    ok.
+
+do_start_msg_store(VHost, Type, Refs, StartFunState) ->
+    case rabbit_vhost_msg_store:start(VHost, Type, Refs, StartFunState) of
+        {ok, _} ->
+            rabbit_log:info("Started message store of type ~s for vhost '~s'~n", [abbreviated_type(Type), VHost]);
+        {error, {no_such_vhost, VHost}} = Err ->
+            rabbit_log:error("Failed to start message store of type ~s for vhost '~s': the vhost no longer exists!~n",
+                             [Type, VHost]),
+            exit(Err);
+        {error, Error} ->
+            rabbit_log:error("Failed to start message store of type ~s for vhost '~s': ~p~n",
+                             [Type, VHost, Error]),
+            exit({error, Error})
+    end.
+
+abbreviated_type(?TRANSIENT_MSG_STORE)  -> transient;
+abbreviated_type(?PERSISTENT_MSG_STORE) -> persistent.
 
 stop_msg_store(VHost) ->
     rabbit_vhost_msg_store:stop(VHost, ?TRANSIENT_MSG_STORE),

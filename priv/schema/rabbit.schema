@@ -207,6 +207,9 @@ end}.
 {mapping, "ssl_options.honor_cipher_order", "rabbit.ssl_options.honor_cipher_order",
     [{datatype, {enum, [true, false]}}]}.
 
+{mapping, "ssl_options.honor_ecc_order", "rabbit.ssl_options.honor_ecc_order",
+    [{datatype, {enum, [true, false]}}]}.
+
 {mapping, "ssl_options.key.RSAPrivateKey", "rabbit.ssl_options.key",
     [{datatype, string}]}.
 
@@ -683,6 +686,14 @@ end}.
 {mapping, "memory_monitor_interval", "rabbit.memory_monitor_interval",
     [{datatype, integer}]}.
 
+%% When set to rss, RabbitMQ will display the memory usage as reported
+%% by the operating system (RSS value), not by the Erlang VM.
+%%
+%% {vm_memory_calculation_strategy, rss},
+
+{mapping, "vm_memory_calculation_strategy", "rabbit.vm_memory_calculation_strategy",
+    [{datatype, {enum, [rss, erlang]}}]}.
+
 %% Set disk free limit (in bytes). Once free disk space reaches this
 %% lower bound, a disk alarm will be set - see the documentation
 %% listed above for more details.
@@ -965,11 +976,11 @@ end}.
 {mapping, "proxy_protocol", "rabbit.proxy_protocol",
     [{datatype, {enum, [true, false]}}]}.
 
-%% Whether to stop the rabbit application if VHost data
-%% cannot be recovered.
+%% Whether to stop the rabbit application if a vhost has
+%% to terminate for any reason.
 
 {mapping, "vhost_restart_strategy", "rabbit.vhost_restart_strategy",
-    [{datatype, {enum, [stop_node, ignore]}}]}.
+    [{datatype, {enum, [stop_node, continue, transient, persistent]}}]}.
 
 % ==========================
 % Lager section

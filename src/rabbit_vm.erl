@@ -30,7 +30,6 @@
 
 %%----------------------------------------------------------------------------
 
-%% Like erlang:memory(), but with awareness of rabbit-y things
 memory() ->
     All = interesting_sups(),
     {Sums, _Other} = sum_processes(
@@ -41,20 +40,20 @@ memory() ->
         [aggregate(Names, Sums, memory, fun (X) -> X end)
          || Names <- distinguished_interesting_sups()],
 
-    Mnesia       = mnesia_memory(),
-    MsgIndexETS  = ets_memory(msg_stores()),
-    MetricsETS   = ets_memory([rabbit_metrics]),
-    MetricsProc  =
-        try
-            [{_, M}] = process_info(whereis(rabbit_metrics), [memory]),
-            M
-        catch
-            error:badarg ->
-            0
-        end,
-    MgmtDbETS    = ets_memory([rabbit_mgmt_storage]),
+    MnesiaETS           = mnesia_memory(),
+    MsgIndexETS         = ets_memory(msg_stores()),
+    MetricsETS          = ets_memory([rabbit_metrics]),
+    MetricsProc  = try
+                       [{_, M}] = process_info(whereis(rabbit_metrics), [memory]),
+                       M
+                   catch
+                       error:badarg ->
+                           0
+                   end,
+    MgmtDbETS           = ets_memory([rabbit_mgmt_storage]),
+    VMTotal             = vm_memory_monitor:get_process_memory(),
 
-    [{total,     Total},
+    [{total,     ErlangTotal},
      {processes, Processes},
      {ets,       ETS},
      {atom,      Atom},
@@ -63,29 +62,49 @@ memory() ->
      {system,    System}] =
         erlang:memory([total, processes, ets, atom, binary, code, system]),
 
+    Unaccounted = case VMTotal - ErlangTotal of
+        GTZ when GTZ > 0 -> GTZ;
+        _LTZ             -> 0
+    end,
+
     OtherProc = Processes
         - ConnsReader - ConnsWriter - ConnsChannel - ConnsOther
         - Qs - QsSlave - MsgIndexProc - Plugins - MgmtDbProc - MetricsProc,
 
-    [{total,              Total},
+    [
+     %% Connections
      {connection_readers,  ConnsReader},
      {connection_writers,  ConnsWriter},
      {connection_channels, ConnsChannel},
      {connection_other,    ConnsOther},
+
+     %% Queues
      {queue_procs,         Qs},
      {queue_slave_procs,   QsSlave},
+
+     %% Processes
      {plugins,             Plugins},
      {other_proc,          lists:max([0, OtherProc])}, %% [1]
-     {mnesia,              Mnesia},
+
+     %% Metrics
      {metrics,             MetricsETS + MetricsProc},
      {mgmt_db,             MgmtDbETS + MgmtDbProc},
-     {msg_index,           MsgIndexETS + MsgIndexProc},
-     {other_ets,           ETS - Mnesia - MsgIndexETS - MgmtDbETS},
+
+     %% ETS
+     {mnesia,              MnesiaETS},
+     {other_ets,           ETS - MnesiaETS - MetricsETS - MgmtDbETS - MsgIndexETS},
+
+     %% Messages (mostly, some binaries are not messages)
      {binary,              Bin},
+     {msg_index,           MsgIndexETS + MsgIndexProc},
+
+     %% System
      {code,                Code},
      {atom,                Atom},
-     {other_system,        System - ETS - Atom - Bin - Code}].
+     {other_system,        System - ETS - Bin - Code - Atom + Unaccounted},
 
+     {total,               VMTotal}
+    ].
 %% [1] - erlang:memory(processes) can be less than the sum of its
 %% parts. Rather than display something nonsensical, just silence any
 %% claims about negative memory. See
