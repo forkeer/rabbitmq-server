@@ -83,7 +83,8 @@ if not exist "!ERLANG_SERVICE_MANAGER_PATH!\erlsrv.exe" (
 )
 
 if "!P1!" == "install" goto INSTALL_SERVICE
-for %%i in (start stop disable enable list remove) do if "%%i" == "!P1!" goto MODIFY_SERVICE
+for %%i in (start stop) do if "%%i" == "!P1!" goto START_STOP_SERVICE
+for %%i in (disable enable list remove) do if "%%i" == "!P1!" goto MODIFY_SERVICE
 
 echo.
 echo *********************
@@ -217,9 +218,13 @@ if not "!RABBITMQ_NODE_IP_ADDRESS!"=="" (
 )
 
 if "!RABBITMQ_LOGS!" == "-" (
+    set SASL_ERROR_LOGGER=tty
     set RABBIT_LAGER_HANDLER=tty
+    set RABBITMQ_LAGER_HANDLER_UPGRADE=tty
 ) else (
+    set SASL_ERROR_LOGGER=false
     set RABBIT_LAGER_HANDLER=\""!RABBITMQ_LOGS:\=/!"\"
+    set RABBITMQ_LAGER_HANDLER_UPGRADE=\""!RABBITMQ_UPGRADE_LOG:\=/!"\"
 )
 
 set RABBITMQ_START_RABBIT=
@@ -255,6 +260,7 @@ set ERLANG_SERVICE_ARGUMENTS= ^
 -sasl sasl_error_logger false ^
 -rabbit lager_log_root \""!RABBITMQ_LOG_BASE:\=/!"\" ^
 -rabbit lager_handler !RABBIT_LAGER_HANDLER! ^
+-rabbit lager_handler_upgrade !RABBITMQ_LAGER_HANDLER_UPGRADE! ^
 -rabbit enabled_plugins_file \""!RABBITMQ_ENABLED_PLUGINS_FILE:\=/!"\" ^
 -rabbit plugins_dir \""!RABBITMQ_PLUGINS_DIR:\=/!"\" ^
 -rabbit plugins_expand_dir \""!RABBITMQ_PLUGINS_EXPAND_DIR:\=/!"\" ^
@@ -288,15 +294,26 @@ set ERLANG_SERVICE_ARGUMENTS=!ERLANG_SERVICE_ARGUMENTS:"=\"!
 if ERRORLEVEL 1 (
     EXIT /B 1
 )
-
 goto END
 
 
 :MODIFY_SERVICE
 
 "!ERLANG_SERVICE_MANAGER_PATH!\erlsrv" !P1! !RABBITMQ_SERVICENAME!
+if ERRORLEVEL 1 (
+    EXIT /B 1
+)
 goto END
 
+
+:START_STOP_SERVICE
+
+REM start and stop via erlsrv reports no error message. Using net instead
+net !P1! !RABBITMQ_SERVICENAME!
+if ERRORLEVEL 1 (
+    EXIT /B 1
+)
+goto END
 
 :END
 

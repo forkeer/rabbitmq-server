@@ -279,18 +279,20 @@ socket_error(Reason) when is_atom(Reason) ->
     rabbit_log_connection:error("Error on AMQP connection ~p: ~s~n",
         [self(), rabbit_misc:format_inet_error(Reason)]);
 socket_error(Reason) ->
-    Level =
-        case Reason of
-            {ssl_upgrade_error, closed} ->
-                %% The socket was closed while upgrading to SSL.
-                %% This is presumably a TCP healthcheck, so don't log
-                %% it unless specified otherwise.
-                debug;
-            _ ->
-                error
-        end,
-    rabbit_log:log(rabbit_log_connection, Level,
-      "Error on AMQP connection ~p:~n~p~n", [self(), Reason]).
+    Fmt = "Error on AMQP connection ~p:~n~p~n",
+    Args = [self(), Reason],
+    case Reason of
+        %% The socket was closed while upgrading to SSL.
+        %% This is presumably a TCP healthcheck, so don't log
+        %% it unless specified otherwise.
+        {ssl_upgrade_error, closed} ->
+            %% Lager sinks (rabbit_log_connection)
+            %% are handled by the lager parse_transform.
+            %% Hence have to define the loglevel as a function call.
+            rabbit_log_connection:debug(Fmt, Args);
+        _ ->
+            rabbit_log_connection:error(Fmt, Args)
+    end.
 
 inet_op(F) -> rabbit_misc:throw_on_error(inet_error, F).
 
@@ -402,30 +404,40 @@ log_connection_exception(Name, Ex) ->
 
 log_connection_exception(Severity, Name, {heartbeat_timeout, TimeoutSec}) ->
     %% Long line to avoid extra spaces and line breaks in log
-    rabbit_log:log(rabbit_log_connection, Severity,
+    log_connection_exception_with_severity(Severity,
         "closing AMQP connection ~p (~s):~n"
         "missed heartbeats from client, timeout: ~ps~n",
         [self(), Name, TimeoutSec]);
 log_connection_exception(Severity, Name, {connection_closed_abruptly,
                                           #v1{connection = #connection{user  = #user{username = Username},
                                                                        vhost = VHost}}}) ->
-    rabbit_log:log(rabbit_log_connection, Severity, "closing AMQP connection ~p (~s, vhost: '~s', user: '~s'):~nclient unexpectedly closed TCP connection~n",
+    log_connection_exception_with_severity(Severity,
+        "closing AMQP connection ~p (~s, vhost: '~s', user: '~s'):~nclient unexpectedly closed TCP connection~n",
         [self(), Name, VHost, Username]);
 %% when client abruptly closes connection before connection.open/authentication/authorization
 %% succeeded, don't log username and vhost as 'none'
 log_connection_exception(Severity, Name, {connection_closed_abruptly, _}) ->
-    rabbit_log:log(rabbit_log_connection, Severity, "closing AMQP connection ~p (~s):~nclient unexpectedly closed TCP connection~n",
+    log_connection_exception_with_severity(Severity,
+        "closing AMQP connection ~p (~s):~nclient unexpectedly closed TCP connection~n",
         [self(), Name]);
 %% old exception structure
 log_connection_exception(Severity, Name, connection_closed_abruptly) ->
-    rabbit_log:log(rabbit_log_connection, Severity,
+    log_connection_exception_with_severity(Severity,
         "closing AMQP connection ~p (~s):~n"
         "client unexpectedly closed TCP connection~n",
         [self(), Name]);
 log_connection_exception(Severity, Name, Ex) ->
-    rabbit_log:log(rabbit_log_connection, Severity,
+    log_connection_exception_with_severity(Severity,
         "closing AMQP connection ~p (~s):~n~p~n",
         [self(), Name, Ex]).
+
+log_connection_exception_with_severity(Severity, Fmt, Args) ->
+    case Severity of
+        debug   -> rabbit_log_connection:debug(Fmt, Args);
+        info    -> rabbit_log_connection:info(Fmt, Args);
+        warning -> rabbit_log_connection:warning(Fmt, Args);
+        error   -> rabbit_log_connection:warning(Fmt, Args)
+    end.
 
 run({M, F, A}) ->
     try apply(M, F, A)
@@ -475,13 +487,12 @@ mainloop(Deb, Buf, BufLen, State = #v1{sock = Sock,
             %%
             %% The goal is to not log TCP healthchecks (a connection
             %% with no data received) unless specified otherwise.
-            Level = case Recv of
-                closed -> debug;
-                _      -> info
-            end,
-            rabbit_log:log(rabbit_log_connection, Level,
-                "accepting AMQP connection ~p (~s)~n",
-                [self(), ConnName]);
+            Fmt = "accepting AMQP connection ~p (~s)~n",
+            Args = [self(), ConnName],
+            case Recv of
+                closed -> rabbit_log_connection:debug(Fmt, Args);
+                _      -> rabbit_log_connection:info(Fmt, Args)
+            end;
         _ ->
             ok
     end,
@@ -567,7 +578,7 @@ handle_other(handshake_timeout, State) ->
     throw({handshake_timeout, State#v1.callback});
 handle_other(heartbeat_timeout, State = #v1{connection_state = closed}) ->
     State;
-handle_other(heartbeat_timeout, 
+handle_other(heartbeat_timeout,
              State = #v1{connection = #connection{timeout_sec = T}}) ->
     maybe_emit_stats(State),
     throw({heartbeat_timeout, T});
@@ -623,7 +634,7 @@ send_blocked(#v1{connection = #connection{protocol     = Protocol,
                  sock       = Sock}, Reason) ->
     case rabbit_misc:table_lookup(Capabilities, <<"connection.blocked">>) of
         {bool, true} ->
-            
+
             ok = send_on_channel0(Sock, #'connection.blocked'{reason = Reason},
                                   Protocol);
         _ ->
@@ -1164,6 +1175,7 @@ handle_method0(#'connection.open'{virtual_host = VHost},
 
     ok = is_over_connection_limit(VHost, User),
     ok = rabbit_access_control:check_vhost_access(User, VHost, Sock),
+    ok = is_vhost_alive(VHost, User),
     NewConnection = Connection#connection{vhost = VHost},
     ok = send_on_channel0(Sock, #'connection.open_ok'{}, Protocol),
 
@@ -1208,6 +1220,16 @@ handle_method0(_Method, State) when ?IS_STOPPING(State) ->
 handle_method0(_Method, #v1{connection_state = S}) ->
     rabbit_misc:protocol_error(
       channel_error, "unexpected method in connection state ~w", [S]).
+
+is_vhost_alive(VHostPath, User) ->
+    case rabbit_vhost_sup_sup:is_vhost_alive(VHostPath) of
+        true  -> ok;
+        false ->
+            rabbit_misc:protocol_error(internal_error,
+                            "access to vhost '~s' refused for user '~s': "
+                            "vhost '~s' is down",
+                            [VHostPath, User#user.username, VHostPath])
+    end.
 
 is_over_connection_limit(VHostPath, User) ->
     try rabbit_vhost_limit:is_over_connection_limit(VHostPath) of
@@ -1567,7 +1589,7 @@ maybe_block(State = #v1{connection_state = CS, throttle = Throttle}) ->
             State1 = State#v1{connection_state = blocked,
                               throttle = update_last_blocked_at(Throttle)},
             case CS of
-                running -> 
+                running ->
                     ok = rabbit_heartbeat:pause_monitor(State#v1.heartbeater);
                 _       -> ok
             end,
@@ -1589,7 +1611,7 @@ maybe_send_unblocked(State = #v1{throttle = Throttle}) ->
     case should_send_unblocked(Throttle) of
         true ->
             ok = send_unblocked(State),
-            State#v1{throttle = 
+            State#v1{throttle =
                 Throttle#throttle{connection_blocked_message_sent = false}};
         false -> State
     end.
@@ -1598,7 +1620,7 @@ maybe_send_blocked_or_unblocked(State = #v1{throttle = Throttle}) ->
     case should_send_blocked(Throttle) of
         true ->
             ok = send_blocked(State, blocked_by_message(Throttle)),
-            State#v1{throttle = 
+            State#v1{throttle =
                 Throttle#throttle{connection_blocked_message_sent = true}};
         false -> maybe_send_unblocked(State)
     end.
@@ -1624,7 +1646,7 @@ control_throttle(State = #v1{connection_state = CS,
         running -> maybe_block(State1);
         %% unblock or re-enable blocking
         blocked -> maybe_block(maybe_unblock(State1));
-        _       -> State1 
+        _       -> State1
     end.
 
 augment_connection_log_name(#connection{client_properties = ClientProperties,

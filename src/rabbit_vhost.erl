@@ -26,6 +26,7 @@
 -export([info/1, info/2, info_all/0, info_all/1, info_all/2, info_all/3]).
 -export([dir/1, msg_store_dir_path/1, msg_store_dir_wildcard/0]).
 -export([delete_storage/1]).
+-export([vhost_down/1]).
 
 -spec add(rabbit_types:vhost(), rabbit_types:username()) -> rabbit_types:ok_or_error(any()).
 -spec delete(rabbit_types:vhost(), rabbit_types:username()) -> rabbit_types:ok_or_error(any()).
@@ -54,8 +55,9 @@ recover() ->
     %% rabbit_vhost_sup_sup will start the actual recovery.
     %% So recovery will be run every time a vhost supervisor is restarted.
     ok = rabbit_vhost_sup_sup:start(),
-    [{ok, _} = rabbit_vhost_sup_sup:vhost_sup(VHost)
-     || VHost <- rabbit_vhost:list()],
+
+    [ ok = rabbit_vhost_sup_sup:init_vhost(VHost)
+      || VHost <- rabbit_vhost:list()],
     ok.
 
 recover(VHost) ->
@@ -69,11 +71,13 @@ recover(VHost) ->
     ok = rabbit_binding:recover(rabbit_exchange:recover(VHost),
                                 [QName || #amqqueue{name = QName} <- Qs]),
     ok = rabbit_amqqueue:start(Qs),
+    %% Start queue mirrors.
+    ok = rabbit_mirror_queue_misc:on_vhost_up(VHost),
     ok.
 
 %%----------------------------------------------------------------------------
 
--define(INFO_KEYS, [name, tracing]).
+-define(INFO_KEYS, [name, tracing, cluster_state]).
 
 add(VHostPath, ActingUser) ->
     rabbit_log:info("Adding vhost '~s'~n", [VHostPath]),
@@ -143,6 +147,12 @@ delete(VHostPath, ActingUser) ->
     %% on all the nodes.
     rabbit_vhost_sup_sup:delete_on_all_nodes(VHostPath),
     ok.
+
+vhost_down(VHostPath) ->
+    ok = rabbit_event:notify(vhost_down,
+                             [{name, VHostPath},
+                              {node, node()},
+                              {user_who_performed_action, ?INTERNAL_USER}]).
 
 delete_storage(VHost) ->
     VhostDir = msg_store_dir_path(VHost),
@@ -253,6 +263,19 @@ infos(Items, X) -> [{Item, i(Item, X)} || Item <- Items].
 
 i(name,    VHost) -> VHost;
 i(tracing, VHost) -> rabbit_trace:enabled(VHost);
+i(cluster_state, VHost) ->
+    Nodes = rabbit_nodes:all_running(),
+    lists:map(fun(Node) ->
+        State = case rabbit_misc:rpc_call(Node,
+                                          rabbit_vhost_sup_sup, is_vhost_alive,
+                                          [VHost]) of
+            {badrpc, nodedown} -> nodedown;
+            true               -> running;
+            false              -> stopped
+        end,
+        {Node, State}
+    end,
+    Nodes);
 i(Item, _)        -> throw({bad_argument, Item}).
 
 info(VHost)        -> infos(?INFO_KEYS, VHost).
