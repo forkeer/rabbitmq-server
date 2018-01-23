@@ -51,8 +51,6 @@ memory() ->
                            0
                    end,
     MgmtDbETS           = ets_memory([rabbit_mgmt_storage]),
-    VMTotal             = vm_memory_monitor:get_process_memory(),
-
     [{total,     ErlangTotal},
      {processes, Processes},
      {ets,       ETS},
@@ -62,10 +60,12 @@ memory() ->
      {system,    System}] =
         erlang:memory([total, processes, ets, atom, binary, code, system]),
 
-    Unaccounted = case VMTotal - ErlangTotal of
-        GTZ when GTZ > 0 -> GTZ;
-        _LTZ             -> 0
-    end,
+    Strategy = vm_memory_monitor:get_memory_calculation_strategy(),
+    Allocated = recon_alloc:memory(allocated),
+    Rss = vm_memory_monitor:get_rss_memory(),
+
+    AllocatedUnused = max(Allocated - ErlangTotal, 0),
+    OSReserved = max(Rss - Allocated, 0),
 
     OtherProc = Processes
         - ConnsReader - ConnsWriter - ConnsChannel - ConnsOther
@@ -73,37 +73,41 @@ memory() ->
 
     [
      %% Connections
-     {connection_readers,  ConnsReader},
-     {connection_writers,  ConnsWriter},
-     {connection_channels, ConnsChannel},
-     {connection_other,    ConnsOther},
+     {connection_readers,   ConnsReader},
+     {connection_writers,   ConnsWriter},
+     {connection_channels,  ConnsChannel},
+     {connection_other,     ConnsOther},
 
      %% Queues
-     {queue_procs,         Qs},
-     {queue_slave_procs,   QsSlave},
+     {queue_procs,          Qs},
+     {queue_slave_procs,    QsSlave},
 
      %% Processes
-     {plugins,             Plugins},
-     {other_proc,          lists:max([0, OtherProc])}, %% [1]
+     {plugins,              Plugins},
+     {other_proc,           lists:max([0, OtherProc])}, %% [1]
 
      %% Metrics
-     {metrics,             MetricsETS + MetricsProc},
-     {mgmt_db,             MgmtDbETS + MgmtDbProc},
+     {metrics,              MetricsETS + MetricsProc},
+     {mgmt_db,              MgmtDbETS + MgmtDbProc},
 
      %% ETS
-     {mnesia,              MnesiaETS},
-     {other_ets,           ETS - MnesiaETS - MetricsETS - MgmtDbETS - MsgIndexETS},
+     {mnesia,               MnesiaETS},
+     {other_ets,            ETS - MnesiaETS - MetricsETS - MgmtDbETS - MsgIndexETS},
 
      %% Messages (mostly, some binaries are not messages)
-     {binary,              Bin},
-     {msg_index,           MsgIndexETS + MsgIndexProc},
+     {binary,               Bin},
+     {msg_index,            MsgIndexETS + MsgIndexProc},
 
      %% System
-     {code,                Code},
-     {atom,                Atom},
-     {other_system,        System - ETS - Bin - Code - Atom + Unaccounted},
-
-     {total,               VMTotal}
+     {code,                 Code},
+     {atom,                 Atom},
+     {other_system,         System - ETS - Bin - Code - Atom},
+     {allocated_unused,     AllocatedUnused},
+     {reserved_unallocated, OSReserved},
+     {strategy,             Strategy},
+     {total,                [{erlang, ErlangTotal},
+                             {rss, Rss},
+                             {allocated, Allocated}]}
     ].
 %% [1] - erlang:memory(processes) can be less than the sum of its
 %% parts. Rather than display something nonsensical, just silence any

@@ -17,6 +17,7 @@
 -module(rabbit_looking_glass).
 
 -ignore_xref([{lg, trace, 4}]).
+-ignore_xref([{maps, from_list, 1}]).
 
 -export([boot/0]).
 -export([connections/0]).
@@ -27,12 +28,22 @@ boot() ->
             ok;
         Value ->
             Input = parse_value(Value),
-            rabbit_log:info("Enabling Looking Glass profiler, input value: ~p", [Input]),
+            rabbit_log:info(
+                "Enabling Looking Glass profiler, input value: ~p",
+                [Input]
+            ),
             {ok, _} = application:ensure_all_started(looking_glass),
-            lg:trace(Input, lg_file_tracer, "traces.lz4", #{
-                mode => profile,
-                running => true,
-                send => true})
+            lg:trace(
+                Input,
+                lg_file_tracer,
+                "traces.lz4",
+                maps:from_list([
+                    {mode, profile},
+                    {process_dump, true},
+                    {running, true},
+                    {send, true}]
+                )
+             )
     end.
 
 parse_value(Value) ->
@@ -43,4 +54,4 @@ parse_value(Value) ->
 
 connections() ->
     Pids = [Pid || {{conns_sup, _}, Pid} <- ets:tab2list(ranch_server)],
-    [{app, rabbit}, {app, rabbit_common}, {scope, Pids}].
+    ['_', {scope, Pids}].

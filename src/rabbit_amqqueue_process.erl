@@ -22,7 +22,7 @@
 
 -define(SYNC_INTERVAL,                 200). %% milliseconds
 -define(RAM_DURATION_UPDATE_INTERVAL, 5000).
--define(CONSUMER_BIAS_RATIO,           1.1). %% i.e. consume 10% faster
+-define(CONSUMER_BIAS_RATIO,           2.0). %% i.e. consume 100% faster
 
 -export([info_keys/0]).
 
@@ -80,6 +80,9 @@
             max_length,
             %% max length in bytes, if configured
             max_bytes,
+            %% an action to perform if queue is to be over a limit,
+            %% can be either drop-head (default) or reject-publish
+            overflow,
             %% when policies change, this version helps queue
             %% determine what previously scheduled/set up state to ignore,
             %% e.g. message expiration messages from previously set up timers
@@ -159,7 +162,8 @@ init_state(Q) ->
                senders             = pmon:new(delegate),
                msg_id_to_channel   = gb_trees:empty(),
                status              = running,
-               args_policy_version = 0},
+               args_policy_version = 0,
+               overflow            = 'drop-head'},
     rabbit_event:init_stats_timer(State, #q.stats_timer).
 
 init_it(Recover, From, State = #q{q = #amqqueue{exclusive_owner = none}}) ->
@@ -260,7 +264,7 @@ init_with_backing_queue_state(Q = #amqqueue{exclusive_owner = Owner}, BQ, BQS,
                      msg_id_to_channel   = MTC},
     State2 = process_args_policy(State1),
     State3 = lists:foldl(fun (Delivery, StateN) ->
-                                 deliver_or_enqueue(Delivery, true, StateN)
+                                 maybe_deliver_or_enqueue(Delivery, true, StateN)
                          end, State2, Deliveries),
     notify_decorators(startup, State3),
     State3.
@@ -378,6 +382,7 @@ process_args_policy(State = #q{q                   = Q,
          {<<"message-ttl">>,             fun res_min/2, fun init_ttl/2},
          {<<"max-length">>,              fun res_min/2, fun init_max_length/2},
          {<<"max-length-bytes">>,        fun res_min/2, fun init_max_bytes/2},
+         {<<"overflow">>,                fun res_arg/2, fun init_overflow/2},
          {<<"queue-mode">>,              fun res_arg/2, fun init_queue_mode/2}],
       drop_expired_msgs(
          lists:foldl(fun({Name, Resolve, Fun}, StateN) ->
@@ -420,6 +425,18 @@ init_max_length(MaxLen, State) ->
 init_max_bytes(MaxBytes, State) ->
     {_Dropped, State1} = maybe_drop_head(State#q{max_bytes = MaxBytes}),
     State1.
+
+init_overflow(undefined, State) ->
+    State;
+init_overflow(Overflow, State) ->
+    OverflowVal = binary_to_existing_atom(Overflow, utf8),
+    case OverflowVal of
+        'drop-head' ->
+            {_Dropped, State1} = maybe_drop_head(State#q{overflow = OverflowVal}),
+            State1;
+        _ ->
+            State#q{overflow = OverflowVal}
+    end.
 
 init_queue_mode(undefined, State) ->
     State;
@@ -621,12 +638,22 @@ attempt_delivery(Delivery = #delivery{sender  = SenderPid,
                             State#q{consumers = Consumers})}
     end.
 
+maybe_deliver_or_enqueue(Delivery, Delivered, State = #q{overflow = Overflow}) ->
+    send_mandatory(Delivery), %% must do this before confirms
+    case {will_overflow(Delivery, State), Overflow} of
+        {true, 'reject-publish'} ->
+            %% Drop publish and nack to publisher
+            send_reject_publish(Delivery, Delivered, State);
+        _ ->
+            %% Enqueue and maybe drop head later
+            deliver_or_enqueue(Delivery, Delivered, State)
+    end.
+
 deliver_or_enqueue(Delivery = #delivery{message = Message,
                                         sender  = SenderPid,
                                         flow    = Flow},
                    Delivered, State = #q{backing_queue       = BQ,
                                          backing_queue_state = BQS}) ->
-    send_mandatory(Delivery), %% must do this before confirms
     {Confirm, State1} = send_or_record_confirm(Delivery, State),
     Props = message_properties(Message, Confirm, State1),
     {IsDuplicate, BQS1} = BQ:is_duplicate(Message, BQS),
@@ -644,6 +671,7 @@ deliver_or_enqueue(Delivery = #delivery{message = Message,
             {BQS3, MTC1} = discard(Delivery, BQ, BQS2, MTC),
             State3#q{backing_queue_state = BQS3, msg_id_to_channel = MTC1};
         {undelivered, State3 = #q{backing_queue_state = BQS2}} ->
+
             BQS3 = BQ:publish(Message, Props, Delivered, SenderPid, Flow, BQS2),
             {Dropped, State4 = #q{backing_queue_state = BQS4}} =
                 maybe_drop_head(State3#q{backing_queue_state = BQS3}),
@@ -665,7 +693,9 @@ deliver_or_enqueue(Delivery = #delivery{message = Message,
 maybe_drop_head(State = #q{max_length = undefined,
                            max_bytes  = undefined}) ->
     {false, State};
-maybe_drop_head(State) ->
+maybe_drop_head(State = #q{overflow = 'reject-publish'}) ->
+    {false, State};
+maybe_drop_head(State = #q{overflow = 'drop-head'}) ->
     maybe_drop_head(false, State).
 
 maybe_drop_head(AlreadyDropped, State = #q{backing_queue       = BQ,
@@ -683,6 +713,35 @@ maybe_drop_head(AlreadyDropped, State = #q{backing_queue       = BQ,
         false ->
             {AlreadyDropped, State}
     end.
+
+send_reject_publish(#delivery{confirm = true,
+                                sender = SenderPid,
+                                msg_seq_no = MsgSeqNo} = Delivery,
+                      _Delivered,
+                      State = #q{ backing_queue = BQ,
+                                  backing_queue_state = BQS,
+                                  msg_id_to_channel   = MTC}) ->
+    {BQS1, MTC1} = discard(Delivery, BQ, BQS, MTC),
+    gen_server2:cast(SenderPid, {reject_publish, MsgSeqNo, self()}),
+    State#q{ backing_queue_state = BQS1, msg_id_to_channel = MTC1 };
+send_reject_publish(#delivery{confirm = false},
+                      _Delivered, State) ->
+    State.
+
+will_overflow(_, #q{max_length = undefined,
+                    max_bytes  = undefined}) -> false;
+will_overflow(#delivery{message = Message},
+              #q{max_length          = MaxLen,
+                 max_bytes           = MaxBytes,
+                 backing_queue       = BQ,
+                 backing_queue_state = BQS}) ->
+    ExpectedQueueLength = BQ:len(BQS) + 1,
+
+    #basic_message{content = #content{payload_fragments_rev = PFR}} = Message,
+    MessageSize = iolist_size(PFR),
+    ExpectedQueueSizeBytes = BQ:info(message_bytes_ready, BQS) + MessageSize,
+
+    ExpectedQueueLength > MaxLen orelse ExpectedQueueSizeBytes > MaxBytes.
 
 over_max_length(#q{max_length          = MaxLen,
                    max_bytes           = MaxBytes,
@@ -1020,8 +1079,8 @@ prioritise_call(Msg, _From, _Len, State) ->
         {info, _Items}                             -> 9;
         consumers                                  -> 9;
         stat                                       -> 7;
-        {basic_consume, _, _, _, _, _, _, _, _, _, _} -> consumer_bias(State);
-        {basic_cancel, _, _, _}                    -> consumer_bias(State);
+        {basic_consume, _, _, _, _, _, _, _, _, _} -> consumer_bias(State, 0, 2);
+        {basic_cancel, _, _, _}                    -> consumer_bias(State, 0, 2);
         _                                          -> 0
     end.
 
@@ -1032,9 +1091,9 @@ prioritise_cast(Msg, _Len, State) ->
         {set_ram_duration_target, _Duration} -> 8;
         {set_maximum_since_use, _Age}        -> 8;
         {run_backing_queue, _Mod, _Fun}      -> 6;
-        {ack, _AckTags, _ChPid}              -> 3; %% [1]
-        {resume, _ChPid}                     -> 2;
-        {notify_sent, _ChPid, _Credit}       -> consumer_bias(State);
+        {ack, _AckTags, _ChPid}              -> 4; %% [1]
+        {resume, _ChPid}                     -> 3;
+        {notify_sent, _ChPid, _Credit}       -> consumer_bias(State, 0, 2);
         _                                    -> 0
     end.
 
@@ -1046,12 +1105,15 @@ prioritise_cast(Msg, _Len, State) ->
 %% stack are optimised for that) and to make things easier to reason
 %% about. Finally, we prioritise ack over resume since it should
 %% always reduce memory use.
+%% bump_reduce_memory_use is prioritised over publishes, because sending
+%% credit to self is hard to reason about. Consumers can continue while
+%% reduce_memory_use is in progress.
 
-consumer_bias(#q{backing_queue = BQ, backing_queue_state = BQS}) ->
+consumer_bias(#q{backing_queue = BQ, backing_queue_state = BQS}, Low, High) ->
     case BQ:msg_rates(BQS) of
-        {0.0,          _} -> 0;
-        {Ingress, Egress} when Egress / Ingress < ?CONSUMER_BIAS_RATIO -> 1;
-        {_,            _} -> 0
+        {0.0,          _} -> Low;
+        {Ingress, Egress} when Egress / Ingress < ?CONSUMER_BIAS_RATIO -> High;
+        {_,            _} -> Low
     end.
 
 prioritise_info(Msg, _Len, #q{q = #amqqueue{exclusive_owner = DownPid}}) ->
@@ -1062,6 +1124,7 @@ prioritise_info(Msg, _Len, #q{q = #amqqueue{exclusive_owner = DownPid}}) ->
         {drop_expired, _Version}             -> 8;
         emit_stats                           -> 7;
         sync_timeout                         -> 6;
+        bump_reduce_memory_use               -> 1;
         _                                    -> 0
     end.
 
@@ -1250,8 +1313,10 @@ handle_cast({run_backing_queue, Mod, Fun},
             State = #q{backing_queue = BQ, backing_queue_state = BQS}) ->
     noreply(State#q{backing_queue_state = BQ:invoke(Mod, Fun, BQS)});
 
-handle_cast({deliver, Delivery = #delivery{sender = Sender,
-                                           flow   = Flow}, SlaveWhenPublished},
+handle_cast({deliver,
+                Delivery = #delivery{sender = Sender,
+                                     flow   = Flow},
+                SlaveWhenPublished},
             State = #q{senders = Senders}) ->
     Senders1 = case Flow of
     %% In both credit_flow:ack/1 we are acking messages to the channel
@@ -1266,7 +1331,7 @@ handle_cast({deliver, Delivery = #delivery{sender = Sender,
                    noflow -> Senders
                end,
     State1 = State#q{senders = Senders1},
-    noreply(deliver_or_enqueue(Delivery, SlaveWhenPublished, State1));
+    noreply(maybe_deliver_or_enqueue(Delivery, SlaveWhenPublished, State1));
 %% [0] The second ack is since the channel thought we were a slave at
 %% the time it published this message, so it used two credits (see
 %% rabbit_amqqueue:deliver/2).
@@ -1450,6 +1515,10 @@ handle_info({bump_credit, Msg}, State = #q{backing_queue       = BQ,
     %% rabbit_variable_queue:msg_store_write/4.
     credit_flow:handle_bump_msg(Msg),
     noreply(State#q{backing_queue_state = BQ:resume(BQS)});
+handle_info(bump_reduce_memory_use, State = #q{backing_queue       = BQ,
+                                               backing_queue_state = BQS0}) ->
+    BQS1 = BQ:handle_info(bump_reduce_memory_use, BQS0),
+    noreply(State#q{backing_queue_state = BQ:resume(BQS1)});
 
 handle_info(Info, State) ->
     {stop, {unhandled_info, Info}, State}.

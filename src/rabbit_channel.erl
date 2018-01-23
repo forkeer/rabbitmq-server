@@ -136,6 +136,9 @@
   %% a list of tags for published messages that were
   %% delivered but are yet to be confirmed to the client
   confirmed,
+  %% a list of tags for published messages that were
+  %% rejected but are yet to be sent to the client
+  rejected,
   %% a dtree used to track oustanding notifications
   %% for messages published as mandatory
   mandatory,
@@ -183,10 +186,21 @@
 
 -define(INFO_KEYS, ?CREATION_EVENT_KEYS ++ ?STATISTICS_KEYS -- [pid]).
 
--define(INCR_STATS(Incs, Measure, State),
+-define(INCR_STATS(Type, Key, Inc, Measure, State),
         case rabbit_event:stats_level(State, #ch.stats_timer) of
-            fine -> incr_stats(Incs, Measure);
-            _    -> ok
+            fine ->
+                rabbit_core_metrics:channel_stats(Type, Measure, {self(), Key}, Inc),
+                %% Keys in the process dictionary are used to clean up the core metrics
+                put({Type, Key}, none);
+            _ ->
+                ok
+        end).
+
+-define(INCR_STATS(Type, Key, Inc, Measure),
+        begin
+            rabbit_core_metrics:channel_stats(Type, Measure, {self(), Key}, Inc),
+            %% Keys in the process dictionary are used to clean up the core metrics
+            put({Type, Key}, none)
         end).
 
 %%----------------------------------------------------------------------------
@@ -369,13 +383,23 @@ force_event_refresh(Ref) ->
 init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, Protocol, User, VHost,
       Capabilities, CollectorPid, LimiterPid]) ->
     process_flag(trap_exit, true),
+    ?LG_PROCESS_TYPE(channel),
     ?store_proc_name({ConnName, Channel}),
     ok = pg_local:join(rabbit_channels, self()),
     Flow = case rabbit_misc:get_env(rabbit, mirroring_flow_control, true) of
              true   -> flow;
              false  -> noflow
            end,
-
+    {ok, {Global, Prefetch}} = application:get_env(rabbit, default_consumer_prefetch),
+    Limiter0 = rabbit_limiter:new(LimiterPid),
+    Limiter = case {Global, Prefetch} of
+                  {true, 0} ->
+                      rabbit_limiter:unlimit_prefetch(Limiter0);
+                  {true, _} ->
+                      rabbit_limiter:limit_prefetch(Limiter0, Prefetch, 0);
+                  _ ->
+                      Limiter0
+              end,
     State = #ch{state                   = starting,
                 protocol                = Protocol,
                 channel                 = Channel,
@@ -383,7 +407,7 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, Protocol, User, VHost,
                 writer_pid              = WriterPid,
                 conn_pid                = ConnPid,
                 conn_name               = ConnName,
-                limiter                 = rabbit_limiter:new(LimiterPid),
+                limiter                 = Limiter,
                 tx                      = none,
                 next_tag                = 1,
                 unacked_message_q       = queue:new(),
@@ -399,11 +423,12 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, Protocol, User, VHost,
                 confirm_enabled         = false,
                 publish_seqno           = 1,
                 unconfirmed             = dtree:empty(),
+                rejected                = [],
                 confirmed               = [],
                 mandatory               = dtree:empty(),
                 capabilities            = Capabilities,
                 trace_state             = rabbit_trace:init(VHost),
-                consumer_prefetch       = 0,
+                consumer_prefetch       = Prefetch,
                 reply_consumer          = none,
                 delivery_flow           = Flow,
                 interceptor_state       = undefined},
@@ -429,6 +454,7 @@ prioritise_call(Msg, _From, _Len, _State) ->
 prioritise_cast(Msg, _Len, _State) ->
     case Msg of
         {confirm,            _MsgSeqNos, _QPid} -> 5;
+        {reject_publish,     _MsgSeqNos, _QPid} -> 5;
         {mandatory_received, _MsgSeqNo,  _QPid} -> 5;
         _                                       -> 0
     end.
@@ -578,6 +604,13 @@ handle_cast({mandatory_received, MsgSeqNo}, State = #ch{mandatory = Mand}) ->
     %% NB: don't call noreply/1 since we don't want to send confirms.
     noreply_coalesce(State#ch{mandatory = dtree:drop(MsgSeqNo, Mand)});
 
+handle_cast({reject_publish, MsgSeqNo, _QPid}, State = #ch{unconfirmed = UC}) ->
+    %% It does not matter which queue rejected the message,
+    %% if any queue rejected it - it should not be confirmed.
+    {MXs, UC1} = dtree:take_one(MsgSeqNo, UC),
+    %% NB: don't call noreply/1 since we don't want to send confirms.
+    noreply_coalesce(record_rejects(MXs, State#ch{unconfirmed = UC1}));
+
 handle_cast({confirm, MsgSeqNos, QPid}, State = #ch{unconfirmed = UC}) ->
     {MXs, UC1} = dtree:take(MsgSeqNos, QPid, UC),
     %% NB: don't call noreply/1 since we don't want to send confirms.
@@ -601,7 +634,7 @@ handle_info(emit_stats, State) ->
     State1 = rabbit_event:reset_stats_timer(State, #ch.stats_timer),
     %% NB: don't call noreply/1 since we don't want to kick off the
     %% stats timer.
-    {noreply, send_confirms(State1), hibernate};
+    {noreply, send_confirms_and_nacks(State1), hibernate};
 
 handle_info({'DOWN', _MRef, process, QPid, Reason}, State) ->
     State1 = handle_publishing_queue_down(QPid, Reason, State),
@@ -661,10 +694,10 @@ reply(Reply, NewState) -> {reply, Reply, next_state(NewState), hibernate}.
 
 noreply(NewState) -> {noreply, next_state(NewState), hibernate}.
 
-next_state(State) -> ensure_stats_timer(send_confirms(State)).
+next_state(State) -> ensure_stats_timer(send_confirms_and_nacks(State)).
 
-noreply_coalesce(State = #ch{confirmed = C}) ->
-    Timeout = case C of [] -> hibernate; _ -> 0 end,
+noreply_coalesce(State = #ch{confirmed = C, rejected = R}) ->
+    Timeout = case {C, R} of {[], []} -> hibernate; _ -> 0 end,
     {noreply, ensure_stats_timer(State), Timeout}.
 
 ensure_stats_timer(State) ->
@@ -798,7 +831,7 @@ check_topic_authorisation(#exchange{name = Name = #resource{virtual_host = VHost
                           RoutingKey,
                           Permission) ->
     Resource = Name#resource{kind = topic},
-    Timeout = get_operation_timeout(),   
+    Timeout = get_operation_timeout(),
     AmqpParams = case ConnPid of
                      none ->
                          %% Called from outside the channel by mgmt API
@@ -941,6 +974,15 @@ maybe_set_fast_reply_to(
     end;
 maybe_set_fast_reply_to(C, _State) ->
     C.
+
+record_rejects([], State) ->
+    State;
+record_rejects(MXs, State = #ch{rejected = R, tx = Tx}) ->
+    Tx1 = case Tx of
+        none -> none;
+        _    -> failed
+    end,
+    State#ch{rejected = [MXs | R], tx = Tx1}.
 
 record_confirms([], State) ->
     State;
@@ -1237,8 +1279,12 @@ handle_method(#'basic.qos'{prefetch_size = Size}, _, _State) when Size /= 0 ->
                                "prefetch_size!=0 (~w)", [Size]);
 
 handle_method(#'basic.qos'{global         = false,
-                           prefetch_count = PrefetchCount}, _, State) ->
-    {reply, #'basic.qos_ok'{}, State#ch{consumer_prefetch = PrefetchCount}};
+                           prefetch_count = PrefetchCount},
+              _, State = #ch{limiter = Limiter}) ->
+    %% Ensures that if default was set, it's overriden
+    Limiter1 = rabbit_limiter:unlimit_prefetch(Limiter),
+    {reply, #'basic.qos_ok'{}, State#ch{consumer_prefetch = PrefetchCount,
+                                        limiter = Limiter1}};
 
 handle_method(#'basic.qos'{global         = true,
                            prefetch_count = 0},
@@ -1611,7 +1657,7 @@ basic_return(#basic_message{exchange_name = ExchangeName,
                             content       = Content},
              State = #ch{protocol = Protocol, writer_pid = WriterPid},
              Reason) ->
-    ?INCR_STATS([{exchange_stats, ExchangeName, 1}], return_unroutable, State),
+    ?INCR_STATS(exchange_stats, ExchangeName, 1, return_unroutable, State),
     {_Close, ReplyCode, ReplyText} = Protocol:lookup_amqp_exception(Reason),
     ok = rabbit_writer:send_command(
            WriterPid,
@@ -1648,14 +1694,14 @@ record_sent(ConsumerTag, AckRequired,
                         user              = #user{username = Username},
                         conn_name         = ConnName,
                         channel           = ChannelNum}) ->
-    ?INCR_STATS([{queue_stats, QName, 1}], case {ConsumerTag, AckRequired} of
-                                               {none,  true} -> get;
-                                               {none, false} -> get_no_ack;
-                                               {_   ,  true} -> deliver;
-                                               {_   , false} -> deliver_no_ack
-                                           end, State),
+    ?INCR_STATS(queue_stats, QName, 1, case {ConsumerTag, AckRequired} of
+                                           {none,  true} -> get;
+                                           {none, false} -> get_no_ack;
+                                           {_   ,  true} -> deliver;
+                                           {_   , false} -> deliver_no_ack
+                                       end, State),
     case Redelivered of
-        true  -> ?INCR_STATS([{queue_stats, QName, 1}], redeliver, State);
+        true  -> ?INCR_STATS(queue_stats, QName, 1, redeliver, State);
         false -> ok
     end,
     rabbit_trace:tap_out(Msg, ConnName, ChannelNum, Username, TraceState),
@@ -1700,11 +1746,11 @@ ack(Acked, State = #ch{queue_names = QNames}) ->
     foreach_per_queue(
       fun (QPid, MsgIds) ->
               ok = rabbit_amqqueue:ack(QPid, MsgIds, self()),
-              ?INCR_STATS(case maps:find(QPid, QNames) of
-                              {ok, QName} -> Count = length(MsgIds),
-                                             [{queue_stats, QName, Count}];
-                              error       -> []
-                          end, ack, State)
+              case maps:find(QPid, QNames) of
+                  {ok, QName} -> Count = length(MsgIds),
+                                 ?INCR_STATS(queue_stats, QName, Count, ack, State);
+                  error       -> ok
+              end
       end, Acked),
     ok = notify_limiter(State#ch.limiter, Acked).
 
@@ -1769,7 +1815,7 @@ deliver_to_queues({#delivery{message   = #basic_message{exchange_name = XName},
                              confirm   = false,
                              mandatory = false},
                    []}, State) -> %% optimisation
-    ?INCR_STATS([{exchange_stats, XName, 1}], publish, State),
+    ?INCR_STATS(exchange_stats, XName, 1, publish, State),
     State;
 deliver_to_queues({Delivery = #delivery{message    = Message = #basic_message{
                                                        exchange_name = XName},
@@ -1806,11 +1852,15 @@ deliver_to_queues({Delivery = #delivery{message    = Message = #basic_message{
                                        Message, State1),
     State3 = process_routing_confirm(  Confirm,   DeliveredQPids, MsgSeqNo,
                                        XName,   State2),
-    ?INCR_STATS([{exchange_stats, XName, 1} |
-                 [{queue_exchange_stats, {QName, XName}, 1} ||
-                     QPid        <- DeliveredQPids,
-                     {ok, QName} <- [maps:find(QPid, QNames1)]]],
-                publish, State3),
+    case rabbit_event:stats_level(State3, #ch.stats_timer) of
+        fine ->
+            ?INCR_STATS(exchange_stats, XName, 1, publish),
+            [?INCR_STATS(queue_exchange_stats, {QName, XName}, 1, publish) ||
+                QPid        <- DeliveredQPids,
+                {ok, QName} <- [maps:find(QPid, QNames1)]];
+        _ ->
+            ok
+    end,
     State3.
 
 process_routing_mandatory(false,     _, _MsgSeqNo, _Msg, State) ->
@@ -1846,21 +1896,24 @@ send_nacks(_MXs, State = #ch{state = closing}) -> %% optimisation
 send_nacks(_, State) ->
     maybe_complete_tx(State#ch{tx = failed}).
 
-send_confirms(State = #ch{tx = none, confirmed = []}) ->
+send_confirms_and_nacks(State = #ch{tx = none, confirmed = [], rejected = []}) ->
     State;
-send_confirms(State = #ch{tx = none, confirmed = C}) ->
+send_confirms_and_nacks(State = #ch{tx = none, confirmed = C, rejected = R}) ->
     case rabbit_node_monitor:pause_partition_guard() of
-        ok      -> MsgSeqNos =
+        ok      -> ConfirmMsgSeqNos =
                        lists:foldl(
                          fun ({MsgSeqNo, XName}, MSNs) ->
-                                 ?INCR_STATS([{exchange_stats, XName, 1}],
+                                 ?INCR_STATS(exchange_stats, XName, 1,
                                              confirm, State),
                                  [MsgSeqNo | MSNs]
                          end, [], lists:append(C)),
-                   send_confirms(MsgSeqNos, State#ch{confirmed = []});
+                   State1 = send_confirms(ConfirmMsgSeqNos, State#ch{confirmed = []}),
+                   %% TODO: msg seq nos, same as for confirms. Need to implement
+                   %% nack rates first.
+                   send_nacks(lists:append(R), State1#ch{rejected = []});
         pausing -> State
     end;
-send_confirms(State) ->
+send_confirms_and_nacks(State) ->
     case rabbit_node_monitor:pause_partition_guard() of
         ok      -> maybe_complete_tx(State);
         pausing -> State
@@ -1953,17 +2006,14 @@ i(Item, _) ->
 name(#ch{conn_name = ConnName, channel = Channel}) ->
     list_to_binary(rabbit_misc:format("~s (~p)", [ConnName, Channel])).
 
-incr_stats(Incs, Measure) ->
-    [begin
-         rabbit_core_metrics:channel_stats(Type, Measure, {self(), Key}, Inc),
-         %% Keys in the process dictionary are used to clean up the core metrics
-         put({Type, Key}, none)
-     end || {Type, Key, Inc} <- Incs].
-
 emit_stats(State) -> emit_stats(State, []).
 
 emit_stats(State, Extra) ->
     [{reductions, Red} | Coarse0] = infos(?STATISTICS_KEYS, State),
+    %% First metric must be `idle_since` (if available), as expected by
+    %% `rabbit_mgmt_format:format_channel_stats`. This is a performance
+    %% optimisation that avoids traversing the whole list when only
+    %% one element has to be formatted.
     rabbit_core_metrics:channel_stats(self(), Extra ++ Coarse0),
     rabbit_core_metrics:channel_stats(reductions, self(), Red).
 
